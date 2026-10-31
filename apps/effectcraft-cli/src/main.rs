@@ -739,9 +739,8 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
             let out = args.opt("--out").unwrap_or("frame.png").to_string();
             let t0 = std::time::Instant::now();
-            let f = b.render_with(comp.as_ref(), time, max_side, args.flag("--transparent"))?;
+            let f = b.render_to_file(comp.as_ref(), time, max_side, args.flag("--transparent"), &out)?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            std::fs::write(&out, &f.png).map_err(|e| format!("cannot write {out}: {e}"))?;
             let info = json!({"path": out, "comp": f.comp, "time": f.time, "width": f.width, "height": f.height, "ms": (ms * 10.0).round() / 10.0});
             if json_out {
                 emit(&info, true);

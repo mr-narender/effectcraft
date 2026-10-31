@@ -6,6 +6,11 @@
 //! Missing sources remain protected by their normalized path. Checks happen before dispatch;
 //! filesystem changes between the check and the write require exporter-side revalidation.
 //!
+//! The commands that write to a path they are given (Save Frame As, Export Lottie, Save a Copy,
+//! Collect Files, Export Timeline…) never replace one of those files either, with no flag:
+//! they write through [`Session::write_output`], the one place that checks. Save and Save As
+//! write the project's own file and do not.
+//!
 //! Nor does a render write one file twice. When two outputs of one job name the same file (two
 //! items with one Output To, a duplicated item, output modules or segments that meet), the one
 //! rendered later replaces what the earlier one just wrote, and nothing is on disk to say so when
@@ -24,6 +29,7 @@ use std::sync::Arc;
 
 use effectcraft_project::render_queue::{RenderQueueItem, log_path, numbered_template, sequence_frame, sequence_parts, sequence_path};
 use effectcraft_project::{Footage, ItemKind};
+use serde_json::{Value, json};
 
 use crate::Session;
 
@@ -37,6 +43,15 @@ const PROBE_LIMIT: u64 = 100_000;
 /// How far a default output name is numbered (`_1` … `_1000`) before it is left to the check at
 /// render time.
 const MAX_NUMBER: u32 = 1_000;
+
+/// What a file is written for, which words a refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Use {
+    /// A Render Queue output (or a preview render): the fix is Output To.
+    Render,
+    /// Anything else written to a path: a frame, an export, a copy.
+    Export,
+}
 
 /// Stands for the frame number in the name a numbered sequence is compared by: a character no
 /// file is named with.
@@ -54,12 +69,28 @@ pub(crate) enum Source {
 }
 
 impl Source {
-    /// Why `path`, a file this reads, cannot be a render's output.
-    pub(crate) fn refusal(&self, path: &str) -> String {
+    /// `footage`, `proxy` or `project`: the `source` of a blocked output.
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
-            Source::Footage(name) => format!("{path} is the footage “{name}” of this project, and a render never replaces footage; choose another Output To"),
-            Source::Proxy(name) => format!("{path} is the proxy of “{name}”, and a render never replaces a proxy; choose another Output To"),
-            Source::Project => format!("{path} is this project's own file, and a render never replaces it; choose another Output To"),
+            Source::Footage(_) => "footage",
+            Source::Proxy(_) => "proxy",
+            Source::Project => "project",
+        }
+    }
+
+    /// Why `path`, a file this reads, cannot be written for `used`.
+    pub(crate) fn refusal(&self, path: &str, used: Use) -> String {
+        match (used, self) {
+            (Use::Render, Source::Footage(name)) => {
+                format!("{path} is the footage “{name}” of this project, and a render never replaces footage; choose another Output To")
+            }
+            (Use::Render, Source::Proxy(name)) => format!("{path} is the proxy of “{name}”, and a render never replaces a proxy; choose another Output To"),
+            (Use::Render, Source::Project) => format!("{path} is this project's own file, and a render never replaces it; choose another Output To"),
+            (Use::Export, Source::Footage(name)) => {
+                format!("{path} is the footage “{name}” of this project, and footage is never written over; choose another file")
+            }
+            (Use::Export, Source::Proxy(name)) => format!("{path} is the proxy of “{name}”, and a proxy is never written over; choose another file"),
+            (Use::Export, Source::Project) => format!("{path} is this project's own file, which only Save writes; choose another file"),
         }
     }
 }
@@ -226,8 +257,8 @@ fn fold(name: &str) -> String {
     if IGNORES_CASE { name.to_lowercase() } else { name.to_string() }
 }
 
-#[cfg(test)]
-fn same_file(a: &Path, b: &Path) -> bool {
+/// Whether two paths are one file: the same name once resolved, or the same file on disk.
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     if key(a) == key(b) {
         return true;
     }
@@ -469,6 +500,45 @@ impl Session {
         Protected::of(self)
     }
 
+    /// What reads the file at `path`, if the project does.
+    fn blocking(&self, path: &str) -> Option<Source> {
+        self.protected_files().find(Path::new(path)).cloned()
+    }
+
+    /// `Err` when `path` is a file the project reads (footage, a proxy, the project file) and so
+    /// is not for an export to replace. For callers that write the file themselves; call it
+    /// before the work, not after it.
+    pub fn refuse_export(&self, path: &str) -> crate::Result<()> {
+        match self.blocking(path) {
+            Some(source) => Err(crate::EngineError::Other(source.refusal(path, Use::Export))),
+            None => Ok(()),
+        }
+    }
+
+    /// Write `bytes` to `path` through the host's services, unless the project reads the file
+    /// there ([`Session::refuse_export`]). Every command that writes to a path it is given
+    /// writes through this; Save and Save As (the project's own file) do not.
+    pub fn write_output(&self, path: &str, bytes: &[u8]) -> crate::Result<()> {
+        self.write_output_with(&self.protected_files(), path, bytes)
+    }
+
+    /// [`Session::write_output`] against files already found ([`Session::protected_files`]),
+    /// for a command that writes many.
+    pub(crate) fn write_output_with(&self, protected: &Protected, path: &str, bytes: &[u8]) -> crate::Result<()> {
+        if let Some(source) = protected.find(Path::new(path)) {
+            return Err(crate::EngineError::Other(source.refusal(path, Use::Export)));
+        }
+        self.services.write_file(path, bytes).map_err(|e| crate::EngineError::Other(format!("cannot write {path}: {e}")))
+    }
+
+    /// `file.checkOutput`'s reply for `path`.
+    pub(crate) fn output_status(&self, path: &str) -> Value {
+        match self.blocking(path) {
+            Some(source) => json!({"path": path, "blocked": true, "source": source.kind(), "reason": source.refusal(path, Use::Export)}),
+            None => json!({"path": path, "blocked": false}),
+        }
+    }
+
     /// Reject protected outputs and ranges that cannot be checked completely. Ordinary-file
     /// replacement consent is left to the exporter, independently of this source guard.
     pub(crate) fn check_outputs(&self, items: &[Vec<(RenderQueueItem, String)>]) -> Vec<Refused> {
@@ -598,7 +668,7 @@ impl Session {
             .map(PathBuf::as_path)
             .chain(movie)
             .chain(Some(Path::new(&log)))
-            .find_map(|path| protected.find(path).map(|source| source.refusal(&path.to_string_lossy()))))
+            .find_map(|path| protected.find(path).map(|source| source.refusal(&path.to_string_lossy(), Use::Render))))
     }
 
     /// A new item's default output must not be a file the project reads, nor one another item of
