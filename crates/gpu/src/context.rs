@@ -30,14 +30,15 @@ const ENTRIES: &[&str] = &[
 const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
-/// [`Enc::dispatch_ext`]).
+/// [`Enc::dispatch_ext`]). Like the effect kernels, one that fails to build (FXC on DirectX 12
+/// can't unroll `classic3d`'s loops, #613) leaves its work to the CPU.
 const EXT_ENTRIES: &[&str] = &["classic3d"];
 
 /// Pixel format of every working texture: premultiplied RGBA, 32-bit float (32 bpc headroom;
 /// 8/16 bpc are emulated by clamping and quantising, as on the CPU).
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-/// Uploaded layer buffers kept on the GPU (bytes).
+/// Uploaded layer buffers kept on the GPU by default (bytes; [`GpuContext::set_upload_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
 
 /// Working textures kept for reuse once their last image is dropped (bytes).
@@ -71,6 +72,10 @@ impl GpuImage {
 struct Lease {
     texture: wgpu::Texture,
     pool: Weak<Mutex<Pool>>,
+    /// The [`Enc`] that took it (see [`Pool::owned`]).
+    owner: u64,
+    /// The pool's [`Pool::generation`] when it was taken.
+    generation: u64,
 }
 
 impl std::fmt::Debug for Lease {
@@ -84,7 +89,7 @@ impl Drop for Lease {
         if let Some(pool) = self.pool.upgrade()
             && let Ok(mut p) = pool.lock()
         {
-            p.release(self.texture.clone());
+            p.release_owned(self.texture.clone(), self.owner, self.generation);
         }
     }
 }
@@ -108,7 +113,19 @@ pub(crate) struct Pool {
     /// Working textures reused / newly allocated (diagnostics, tests).
     hits: u64,
     misses: u64,
+    /// Textures released while the [`Enc`] that took them is alive, kept for that `Enc` only.
+    /// Its later commands run after everything it recorded or submitted before (one queue,
+    /// recording order), so it can overwrite them at once instead of allocating a new texture
+    /// for every intermediate of a frame (a 4K frame holds dozens). Other encoders never see a
+    /// working texture of another `Enc` before it is gone.
+    owned: HashMap<u64, HashMap<(u32, u32), Vec<wgpu::Texture>>>,
+    next_owner: u64,
+    /// Raised by [`Pool::discard`]: a texture taken before it never comes back to the pool.
+    generation: u64,
 }
+
+/// In-`Enc` texture reuse ([`Pool::owned`]); tests turn it off to compare.
+pub(crate) static TEXTURE_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Counts of uploads (CPU → GPU) and readbacks (GPU → CPU).
 #[derive(Default)]
@@ -126,6 +143,74 @@ pub struct TransferStats {
     pub upload_bytes: u64,
     pub readbacks: u64,
     pub readback_bytes: u64,
+}
+
+/// `WGPU_ADAPTER_NAME` trimmed; empty or whitespace-only counts as unset (an empty
+/// substring would otherwise match the first adapter and skip the power preference).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn wanted_adapter_name(var: Option<&str>) -> Option<&str> {
+    var.map(str::trim).filter(|w| !w.is_empty())
+}
+
+/// Index of the first adapter whose name contains `want`, compared case-insensitively.
+/// Only the name is matched, as in wgpu (the backend is chosen with `WGPU_BACKEND`).
+/// `Err` lists each distinct adapter once as `name (backend)`, so a typo or an
+/// OS/driver-specific name is easy to spot.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn match_adapter_name(want: &str, adapters: &[(String, String)]) -> Result<usize, String> {
+    if adapters.is_empty() {
+        return Err(format!("WGPU_ADAPTER_NAME={want:?}: no adapters on the enabled backends"));
+    }
+    let w = want.to_lowercase();
+    adapters.iter().position(|(n, _)| n.to_lowercase().contains(&w)).ok_or_else(|| {
+        let mut list: Vec<String> = Vec::new();
+        for l in adapters.iter().map(|(n, b)| format!("{n} ({b})")) {
+            if !list.contains(&l) {
+                list.push(l);
+            }
+        }
+        format!(
+            "no adapter name matches WGPU_ADAPTER_NAME={want:?} (matched against the name only; \
+             select a backend with WGPU_BACKEND); available: [{}]",
+            list.join(", ")
+        )
+    })
+}
+
+/// The adapter named by `WGPU_ADAPTER_NAME` (case-insensitive substring, like wgpu's
+/// `initialize_adapter_from_env`, which panics when none matches). `None` when unset or empty.
+#[cfg(not(target_arch = "wasm32"))]
+async fn adapter_by_name(instance: &wgpu::Instance) -> Option<Result<wgpu::Adapter, String>> {
+    let var = std::env::var("WGPU_ADAPTER_NAME").ok();
+    let want = wanted_adapter_name(var.as_deref())?;
+    let mut all = instance.enumerate_adapters(wgpu::Backends::all()).await;
+    let adapters: Vec<(String, String)> = all
+        .iter()
+        .map(|a| {
+            let i = a.get_info();
+            (i.name, format!("{:?}", i.backend))
+        })
+        .collect();
+    Some(match_adapter_name(want, &adapters).map(|i| all.swap_remove(i)))
+}
+/// `WGPU_POWER_PREF` (`low` / `high` / `none`), default HighPerformance. wgpu ignores an
+/// unknown value silently; warn so a typo is noticed.
+#[cfg(not(target_arch = "wasm32"))]
+fn power_pref_from_env() -> wgpu::PowerPreference {
+    wgpu::PowerPreference::from_env().unwrap_or_else(|| {
+        if let Ok(v) = std::env::var("WGPU_POWER_PREF") {
+            log::warn!("gpu: ignoring WGPU_POWER_PREF={v:?} (expected low, high or none)");
+        }
+        wgpu::PowerPreference::HighPerformance
+    })
+}
+#[cfg(target_arch = "wasm32")]
+fn power_pref_from_env() -> wgpu::PowerPreference {
+    wgpu::PowerPreference::HighPerformance
+}
+#[cfg(target_arch = "wasm32")]
+async fn adapter_by_name(_: &wgpu::Instance) -> Option<Result<wgpu::Adapter, String>> {
+    None
 }
 
 impl Transfers {
@@ -178,6 +263,40 @@ impl Pool {
         }
     }
 
+    fn register(&mut self) -> u64 {
+        self.next_owner += 1;
+        if TEXTURE_REUSE.load(std::sync::atomic::Ordering::Relaxed) {
+            self.owned.insert(self.next_owner, HashMap::new());
+        }
+        self.next_owner
+    }
+
+    /// `Enc` `owner` is gone: its kept textures go through the shared pool.
+    fn unregister(&mut self, owner: u64) {
+        if let Some(m) = self.owned.remove(&owner) {
+            for t in m.into_values().flatten() {
+                self.release(t);
+            }
+        }
+    }
+
+    fn release_owned(&mut self, t: wgpu::Texture, owner: u64, generation: u64) {
+        if generation != self.generation {
+            return;
+        }
+        if let Some(m) = self.owned.get_mut(&owner) {
+            m.entry((t.width(), t.height())).or_default().push(t);
+            return;
+        }
+        self.release(t);
+    }
+
+    fn take_owned(&mut self, owner: u64, w: u32, h: u32) -> Option<wgpu::Texture> {
+        let t = self.owned.get_mut(&owner)?.get_mut(&(w, h))?.pop()?;
+        self.hits += 1;
+        Some(t)
+    }
+
     fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
         match &t {
@@ -193,6 +312,18 @@ impl Pool {
     fn clear(&mut self) {
         self.free.clear();
         self.bytes = 0;
+    }
+
+    /// After a failed frame (#1319): drop every kept texture, the free ones and those waiting
+    /// for an open encoder or kept by one, and the textures still out never return. The
+    /// encoders' bookkeeping stays, so reuse remains ordered.
+    fn discard(&mut self) {
+        self.clear();
+        self.released.clear();
+        for kept in self.owned.values_mut() {
+            kept.clear();
+        }
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -240,6 +371,7 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub(crate) name: String,
     pub(crate) max_dim: u32,
+    pub(crate) median_kernel: crate::fx_noise::MedianKernel,
     bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
@@ -253,6 +385,8 @@ pub struct GpuContext {
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
     uploads: Mutex<Uploads>,
+    upload_budget: std::sync::atomic::AtomicUsize,
+    upload_full_warned: std::sync::atomic::AtomicBool,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
@@ -270,6 +404,12 @@ pub struct GpuContext {
     pub(crate) particle_states: crate::particles::StatesCell,
     /// Deferred readbacks (a browser worker's WebGPU device), see [`crate::deferred`].
     pub(crate) deferred: Option<Arc<crate::deferred::Deferred>>,
+    /// The adapter is a software rasteriser (llvmpipe, WARP): its float maths follows the
+    /// CPU's exactly, so the YUV tests hold it to exact parity.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) software: bool,
+    /// Export frame → YUV 4:2:0 kernel (built on first use).
+    pub(crate) yuv: std::sync::OnceLock<Result<crate::yuv::YuvPipe, String>>,
     readbacks: Arc<crate::readback::Readbacks>,
 }
 
@@ -323,7 +463,7 @@ pub(crate) fn init_resource<T>(device: &wgpu::Device, label: &str, create: impl 
 /// Browser scope completion is asynchronous. Preserve the existing browser constructor;
 /// never block its event loop or introduce a guard across an asynchronous boundary here.
 #[cfg(target_arch = "wasm32")]
-fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
     Ok(create())
 }
 
@@ -349,6 +489,12 @@ pub(crate) fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Opt
     buffer
 }
 
+/// The descriptor for a device the compositor owns: `MemoryUsage` so freed textures give their
+/// allocator blocks back instead of a few long-lived objects pinning large ones.
+pub(crate) fn device_descriptor(required_limits: wgpu::Limits) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor { label: Some("effectcraft gpu"), required_limits, memory_hints: wgpu::MemoryHints::MemoryUsage, ..Default::default() }
+}
+
 impl GpuContext {
     /// [`buffer_init`] on this context's device.
     pub(crate) fn buffer_init(&self, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -362,6 +508,9 @@ impl GpuContext {
     /// [`Self::device_failure_notifier`] for immediate readback cancellation.
     pub fn new(adapter: &wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue) -> Result<GpuContext, String> {
         let info = adapter.get_info();
+        let median_kernel = crate::fx_noise::MedianKernel::for_adapter(info.backend, info.device_type);
+        #[cfg(test)]
+        let median_kernel = median_kernel.test_override()?;
         if !adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS) {
             return Err(format!("{} ({:?}): no compute shaders", info.name, info.backend));
         }
@@ -381,6 +530,7 @@ impl GpuContext {
             ("max_compute_workgroup_size_x", l.max_compute_workgroup_size_x, 64),
             ("max_compute_workgroup_size_y", l.max_compute_workgroup_size_y, 16),
             ("max_compute_invocations_per_workgroup", l.max_compute_invocations_per_workgroup, 256),
+            ("max_compute_workgroup_storage_size", l.max_compute_workgroup_storage_size, median_kernel.workgroup_storage()),
         ];
         if let Some((limit, have, need)) = needs.iter().find(|(_, have, need)| have < need) {
             return Err(format!("{} ({:?}): device limit {limit} is {have}, needs {need}", info.name, info.backend));
@@ -406,6 +556,7 @@ impl GpuContext {
             include_str!("shaders/fx_key.wgsl"),
             include_str!("shaders/fx_stylize.wgsl"),
             include_str!("shaders/fx_noise.wgsl"),
+            median_kernel.source(),
             include_str!("shaders/fx_tone.wgsl"),
             include_str!("shaders/fx_warp.wgsl"),
             include_str!("shaders/fx_extra.wgsl"),
@@ -491,15 +642,21 @@ impl GpuContext {
             })
         };
         // The compositor's own kernels are required; an effect kernel that doesn't build is
-        // left out, and its effects render on the CPU (see `Enc::take_missing`).
-        let mut pipelines = ENTRIES
-            .iter()
-            .chain(crate::adv3d::SKY_KERNELS)
-            .map(|e| (e, &layout))
-            .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
-            .map(|(e, layout)| Ok((*e, build(e, layout)?)))
-            .collect::<Result<HashMap<_, _>, String>>()?;
+        // left out, and its effects render on the CPU (see `Enc::take_missing`). So is a
+        // missing Classic 3D kernel: its 3D runs render on the CPU.
+        let mut pipelines = ENTRIES.iter().chain(crate::adv3d::SKY_KERNELS).map(|e| Ok((*e, build(e, &layout)?))).collect::<Result<HashMap<_, _>, String>>()?;
         let mut unavailable = vec![];
+        for e in EXT_ENTRIES {
+            match build(e, &layout_ext) {
+                Ok(p) => {
+                    pipelines.insert(*e, p);
+                }
+                Err(why) => {
+                    log::warn!("gpu {name}: kernel {e} unavailable, its 3D layers render on the CPU: {why}");
+                    unavailable.push((*e, why));
+                }
+            }
+        }
         for e in EFFECT_ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
@@ -587,6 +744,7 @@ impl GpuContext {
             queue,
             name,
             max_dim,
+            median_kernel,
             bgl,
             bgl_ext,
             pipelines,
@@ -598,11 +756,15 @@ impl GpuContext {
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
+            upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
+            upload_full_warned: Default::default(),
             pool: Default::default(),
             staging: Default::default(),
             transfers: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
+            yuv: std::sync::OnceLock::new(),
+            software: info.device_type == wgpu::DeviceType::Cpu,
             adv3d_raster: adv3d_unsupported.is_none(),
             particles: Default::default(),
             particle_states: Default::default(),
@@ -616,6 +778,18 @@ impl GpuContext {
     /// Shared-device hosts must forward their device failures through the notifier.
     pub fn check_health(&self) -> Result<(), String> {
         self.readbacks.check()
+    }
+
+    /// Export frame → YUV 4:2:0 kernel, initialized once and `None` when shader or pipeline creation fails.
+    pub(crate) fn yuv_pipe(&self) -> Option<&crate::yuv::YuvPipe> {
+        self.yuv
+            .get_or_init(|| {
+                crate::yuv::YuvPipe::new(&self.device).inspect_err(|e| {
+                    log::warn!(target: "effectcraft_gpu", "yuv420 kernel unavailable: {e}");
+                })
+            })
+            .as_ref()
+            .ok()
     }
 
     /// A notification hook for the owner of a shared device's error/loss handlers.
@@ -727,29 +901,38 @@ impl GpuContext {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // Match eframe's backend override so CLI and headless acceptance tests
-            // exercise the backend requested for the native viewer.
-            desc.backends = wgpu::Backends::from_env().unwrap_or(desc.backends);
+            // Honour the same wgpu env vars as the viewer (WGPU_BACKEND, WGPU_DX12_COMPILER,
+            // WGPU_VALIDATION, WGPU_DEBUG, WGPU_POWER_PREF), plus WGPU_ADAPTER_NAME (CLI/headless
+            // only for now; the viewer ignores it). Not full parity: the viewer also changes
+            // instance flags and has a GL fallback.
+            // Note: with_env() also resets memory_budget_thresholds to their default (unused here).
+            desc = desc.with_env();
         }
         #[cfg(target_arch = "wasm32")]
         {
             desc.backends = wgpu::Backends::BROWSER_WEBGPU;
         }
         let instance = wgpu::Instance::new(desc);
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
-            .await
-            .map_err(|e| format!("no adapter: {e}"))?;
+        let (adapter, by_name) = match adapter_by_name(&instance).await {
+            Some(a) => (a?, true),
+            None => (
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions { power_preference: power_pref_from_env(), ..Default::default() })
+                    .await
+                    .map_err(|e| format!("no adapter: {e}"))?,
+                false,
+            ),
+        };
         let limits = adapter.limits();
         let required_limits = wgpu::Limits {
             max_texture_dimension_2d: limits.max_texture_dimension_2d.min(16384),
             max_buffer_size: limits.max_buffer_size,
             ..wgpu::Limits::default()
         };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: Some("effectcraft gpu"), required_limits, ..Default::default() })
-            .await
-            .map_err(|e| format!("no device: {e}"))?;
+        let (device, queue) = adapter.request_device(&device_descriptor(required_limits)).await.map_err(|e| match by_name {
+            true => format!("no device on {} (picked by WGPU_ADAPTER_NAME): {e}", adapter.get_info().name),
+            false => format!("no device: {e}"),
+        })?;
         let context = GpuContext::new(&adapter, device, queue)?;
         // This path owns the device; install handlers only after construction succeeds.
         crate::readback::install(&context.device, &context.readbacks);
@@ -770,11 +953,59 @@ impl GpuContext {
         &self.unavailable
     }
 
+    /// Whether kernel `entry` was built (an effect or Classic 3D kernel can be missing, #613).
+    pub(crate) fn has_kernel(&self, entry: &str) -> bool {
+        self.pipelines.contains_key(entry)
+    }
+
     /// Leave kernel `entry` out, as if it had failed to build (tests of the CPU fallback).
     #[cfg(test)]
     pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
         self.pipelines.remove(entry);
         self.unavailable.push((entry, "dropped by a test".into()));
+    }
+
+    /// A copy of this context sharing the same [`wgpu::Device`] and [`wgpu::Queue`] with
+    /// kernel `entry` left out, as if it had failed to build (tests of the CPU fallback
+    /// without opening a second device on `llvmpipe`).
+    #[cfg(test)]
+    pub(crate) fn without_kernel(&self, entry: &'static str) -> GpuContext {
+        let mut pipelines = self.pipelines.clone();
+        pipelines.remove(entry);
+        let mut unavailable = self.unavailable.clone();
+        unavailable.push((entry, "dropped by a test".into()));
+        GpuContext {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            name: self.name.clone(),
+            max_dim: self.max_dim,
+            median_kernel: self.median_kernel,
+            bgl: self.bgl.clone(),
+            bgl_ext: self.bgl_ext.clone(),
+            pipelines,
+            unavailable,
+            display_bgl: self.display_bgl.clone(),
+            display: self.display.clone(),
+            display_mip: self.display_mip.clone(),
+            dummy_tex: self.dummy_tex.clone(),
+            dummy: self.dummy.clone(),
+            dummy_buf: self.dummy_buf.clone(),
+            uploads: Mutex::new(Uploads::default()),
+            upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
+            upload_full_warned: Default::default(),
+            pool: self.pool.clone(),
+            staging: Default::default(),
+            transfers: Default::default(),
+            zeros: Default::default(),
+            adv3d: std::sync::OnceLock::new(),
+            adv3d_raster: self.adv3d_raster,
+            particles: Default::default(),
+            particle_states: Default::default(),
+            deferred: self.deferred.clone(),
+            readbacks: self.readbacks.clone(),
+            software: self.software,
+            yuv: std::sync::OnceLock::new(),
+        }
     }
 
     /// Bytes of readback staging buffers kept for reuse (tests).
@@ -803,8 +1034,9 @@ impl GpuContext {
     }
 
     fn texture(&self, w: u32, h: u32) -> wgpu::Texture {
+        // Named with its size, so a GPU error about it says which texture failed (#1319).
         self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
+            label: Some(&format!("working image {w}×{h}")),
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
@@ -817,13 +1049,24 @@ impl GpuContext {
 
     /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
     /// one is zeroed.
-    fn pooled(&self, w: u32, h: u32) -> (GpuImage, bool) {
+    fn pooled(&self, w: u32, h: u32, owner: u64) -> (GpuImage, bool) {
         let (w, h) = (w.max(1), h.max(1));
-        let reused = self.pool.lock().ok().and_then(|mut p| p.take(w, h));
+        let (reused, generation) = self.pool.lock().map(|mut p| (p.take_owned(owner, w, h).or_else(|| p.take(w, h)), p.generation)).unwrap_or((None, u64::MAX));
         let was_reused = reused.is_some();
         let texture = reused.unwrap_or_else(|| self.texture(w, h));
-        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
+        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool), owner, generation });
         (GpuImage { texture, width: w, height: h, _lease: Some(lease), levels: None }, was_reused)
+    }
+
+    /// Bytes of uploaded layer textures the context keeps (default 1536 MB). An application that
+    /// knows the device's memory can raise it (static layers of a big frame upload once) or lower
+    /// it (a small GPU); the least recently used textures go first.
+    pub fn set_upload_budget(&self, bytes: usize) {
+        self.upload_budget.store(bytes.max(1 << 20), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn upload_budget(&self) -> usize {
+        self.upload_budget.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Uploads and readbacks so far (images; uploads of cached layers count once).
@@ -859,6 +1102,12 @@ impl GpuContext {
         Some(g)
     }
 
+    /// Entries in the layer upload cache.
+    #[cfg(test)]
+    pub(crate) fn upload_entries(&self) -> usize {
+        self.uploads.lock().map(|u| u.map.len()).unwrap_or_default()
+    }
+
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static
     /// layers upload once, not every frame.
     pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
@@ -881,16 +1130,24 @@ impl GpuContext {
                 u.bytes -= old.bytes;
             }
             u.bytes += bytes;
-            // Drop textures of freed buffers, then the least recently used over budget.
-            if u.bytes > UPLOAD_BUDGET {
-                let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
-                for k in dead {
-                    if let Some(e) = u.map.remove(&k) {
-                        u.bytes -= e.bytes;
-                    }
+            // Drop textures of freed buffers at once (a layer whose buffer changes every frame
+            // makes a new one each time, and nothing can hit the old one again), then the least
+            // recently used over budget.
+            let budget = self.upload_budget();
+            let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
+            for k in dead {
+                if let Some(e) = u.map.remove(&k) {
+                    u.bytes -= e.bytes;
                 }
             }
-            while u.bytes > UPLOAD_BUDGET {
+            if u.bytes > budget && !self.upload_full_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    target: "effectcraft_gpu",
+                    "GPU upload cache full ({} MB): evicting layer textures, which upload again when next used; a frame whose static layers exceed it re-uploads them every frame",
+                    budget >> 20
+                );
+            }
+            while u.bytes > budget {
                 let Some(k) = u.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
                 if let Some(e) = u.map.remove(&k) {
                     u.bytes -= e.bytes;
@@ -913,6 +1170,21 @@ impl GpuContext {
             s.clear();
         }
     }
+
+    /// After a failed frame: forget every texture and buffer kept for reuse, since any of them
+    /// may be one the device rejected (#1319). Later frames allocate afresh.
+    pub fn discard_kept(&self) {
+        self.clear_uploads();
+        if let Ok(mut p) = self.pool.lock() {
+            p.discard();
+        }
+        if let Ok(mut z) = self.zeros.lock() {
+            z.clear();
+        }
+        if let Ok(mut c) = self.particle_states.lock() {
+            c.clear();
+        }
+    }
 }
 
 /// Records GPU work for one render (a command encoder submitted at readback or the end).
@@ -923,22 +1195,33 @@ pub(crate) struct Enc<'g> {
     pending: usize,
     /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
     missing: bool,
+    /// This `Enc`'s id in the texture pool (textures it may reuse at once).
+    owner: u64,
+}
+
+/// Images bound to a compute kernel's source, optional auxiliary and output slots.
+pub(crate) struct KernelImages<'a> {
+    pub src: &'a GpuImage,
+    pub aux: Option<&'a GpuImage>,
+    pub out: &'a GpuImage,
 }
 
 impl Drop for Enc<'_> {
     fn drop(&mut self) {
         // Unsubmitted work is discarded, so nothing recorded will read pooled textures.
-        if let Some((_, id)) = self.enc.take()
-            && let Ok(mut p) = self.g.pool.lock()
-        {
-            p.close(id);
+        if let Ok(mut p) = self.g.pool.lock() {
+            if let Some((_, id)) = self.enc.take() {
+                p.close(id);
+            }
+            p.unregister(self.owner);
         }
     }
 }
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, missing: false }
+        let owner = g.pool.lock().map(|mut p| p.register()).unwrap_or(0);
+        Enc { g, enc: None, pending: 0, missing: false, owner }
     }
 
     /// Whether a dispatch since the last call named a kernel the device doesn't have (one
@@ -960,7 +1243,7 @@ impl<'g> Enc<'g> {
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, reused) = self.g.pooled(w, h);
+        let (img, reused) = self.g.pooled(w, h, self.owner);
         if reused {
             self.fill(&img, 0.0);
         }
@@ -970,7 +1253,7 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, _) = self.g.pooled(w, h);
+        let (img, _) = self.g.pooled(w, h, self.owner);
         if cfg!(test) {
             self.fill(&img, f32::NAN);
         }
@@ -996,32 +1279,21 @@ impl<'g> Enc<'g> {
     }
 
     /// Run kernel `entry` writing `out` (dispatched over `groups` workgroups).
-    pub fn dispatch(
-        &mut self,
-        entry: &str,
-        p: &Params,
-        src: &GpuImage,
-        aux: Option<&GpuImage>,
-        out: &GpuImage,
-        data: Option<&wgpu::Buffer>,
-        groups: (u32, u32),
-    ) {
-        self.dispatch_ext(entry, p, src, aux, out, data, groups, None);
+    pub fn dispatch(&mut self, entry: &str, p: &Params, images: KernelImages<'_>, data: Option<&wgpu::Buffer>, groups: (u32, u32)) {
+        self.dispatch_ext(entry, p, images, data, groups, None);
     }
 
     /// [`Enc::dispatch`] for the kernels in `EXT_ENTRIES`, with their group 1 storage buffers.
-    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_ext(
         &mut self,
         entry: &str,
         p: &Params,
-        src: &GpuImage,
-        aux: Option<&GpuImage>,
-        out: &GpuImage,
+        images: KernelImages<'_>,
         data: Option<&wgpu::Buffer>,
         groups: (u32, u32),
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
+        let KernelImages { src, aux, out } = images;
         let g = self.g;
         let Some(pipe) = g.pipelines.get(entry) else {
             if !g.unavailable.iter().any(|(e, _)| *e == entry) {
@@ -1077,7 +1349,7 @@ impl<'g> Enc<'g> {
     /// Per-pixel kernel over `out`'s size (16×16 workgroups).
     pub fn pixels(&mut self, entry: &str, p: &Params, src: &GpuImage, aux: Option<&GpuImage>, out: &GpuImage, data: Option<&wgpu::Buffer>) {
         let groups = (out.width.div_ceil(16), out.height.div_ceil(16));
-        self.dispatch(entry, p, src, aux, out, data, groups);
+        self.dispatch(entry, p, KernelImages { src, aux, out }, data, groups);
     }
 
     /// Copy `src` into a larger zeroed image at (`x`, `y`) (Buf::pad).
@@ -1088,6 +1360,24 @@ impl<'g> Enc<'g> {
             wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::Extent3d { width: src.width, height: src.height, depth_or_array_layers: 1 },
         );
+    }
+
+    /// A `w` × `h` image showing `src` with its pixel (`x`, `y`) at the top-left, transparent
+    /// where `src` doesn't reach (Image::crop).
+    pub fn crop(&mut self, src: &GpuImage, x: i64, y: i64, w: u32, h: u32) -> GpuImage {
+        let dst = self.image(w, h);
+        let span = |o: i64, n: u32, len: u32| {
+            let (a, b) = (o.max(0), (o + n as i64).min(len as i64));
+            (b > a).then(|| (a as u32, (a - o) as u32, (b - a) as u32))
+        };
+        let (Some((sx, dx, cw)), Some((sy, dy, ch))) = (span(x, w, src.width), span(y, h, src.height)) else { return dst };
+        let enc = self.encoder();
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x: sx, y: sy, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x: dx, y: dy, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+        );
+        dst
     }
 
     /// Submit recorded work.
@@ -1315,4 +1605,67 @@ impl<'g> Enc<'g> {
 /// Mip levels of a full chain for a `w × h` texture (down to 1 × 1).
 pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
     u32::BITS - w.max(h).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod adapter_name_tests {
+    use super::{match_adapter_name, wanted_adapter_name};
+
+    fn adapters() -> Vec<(String, String)> {
+        [("NVIDIA GeForce GTX 1070", "Vulkan"), ("Intel(R) UHD Graphics 630", "Dx12"), ("llvmpipe (LLVM 19.1.7, 256 bits)", "Gl")]
+            .map(|(n, b)| (n.into(), b.into()))
+            .to_vec()
+    }
+
+    #[test]
+    fn matches_case_insensitive_substring() {
+        assert_eq!(match_adapter_name("intel", &adapters()), Ok(1));
+        assert_eq!(match_adapter_name("GTX 1070", &adapters()), Ok(0));
+        assert_eq!(match_adapter_name("LLVMPIPE", &adapters()), Ok(2));
+    }
+
+    #[test]
+    fn first_match_wins() {
+        assert_eq!(match_adapter_name("i", &adapters()), Ok(0));
+    }
+
+    #[test]
+    fn empty_or_blank_name_is_unset_and_value_is_trimmed() {
+        assert_eq!(wanted_adapter_name(None), None);
+        assert_eq!(wanted_adapter_name(Some("")), None);
+        assert_eq!(wanted_adapter_name(Some("  ")), None);
+        assert_eq!(wanted_adapter_name(Some(" intel ")), Some("intel"));
+        assert_eq!(match_adapter_name(wanted_adapter_name(Some(" intel ")).unwrap(), &adapters()), Ok(1));
+    }
+
+    #[test]
+    fn mismatch_lists_name_and_backend() {
+        let e = match_adapter_name("NoSuch", &adapters()).unwrap_err();
+        assert!(e.contains("\"NoSuch\""), "{e}");
+        assert!(e.contains("Intel(R) UHD Graphics 630 (Dx12)"), "{e}");
+        assert!(e.contains("NVIDIA GeForce GTX 1070 (Vulkan)"), "{e}");
+    }
+
+    #[test]
+    fn backend_is_not_part_of_the_match_and_message_says_so() {
+        let e = match_adapter_name("dx12", &adapters()).unwrap_err();
+        assert!(e.contains("name only"), "{e}");
+        assert!(e.contains("WGPU_BACKEND"), "{e}");
+    }
+
+    #[test]
+    fn mismatch_lists_identical_name_and_backend_once() {
+        let mut a = adapters();
+        a.insert(2, ("Intel(R) UHD Graphics 630".into(), "Dx12".into()));
+        a.push(("Intel(R) UHD Graphics 630".into(), "Vulkan".into()));
+        let e = match_adapter_name("NoSuch", &a).unwrap_err();
+        assert_eq!(e.matches("Intel(R) UHD Graphics 630 (Dx12)").count(), 1, "{e}");
+        assert_eq!(e.matches("Intel(R) UHD Graphics 630 (Vulkan)").count(), 1, "{e}");
+    }
+
+    #[test]
+    fn no_adapters_has_its_own_message() {
+        let e = match_adapter_name("x", &[]).unwrap_err();
+        assert!(e.contains("no adapters on the enabled backends"), "{e}");
+    }
 }
