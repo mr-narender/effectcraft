@@ -244,7 +244,8 @@ pub struct Session {
     pub next_task_id: u64,
     /// The running Learn tutorial (Home ▸ Learn), see [`learn`].
     pub learn: Option<learn::Progress>,
-    /// Check footage in the background after File ▸ Open ([`footage_check`]): frontends with an
+    /// Track footage availability automatically, after File ▸ Open ([`footage_check`]) and in
+    /// the desktop disk watcher. Frontends with an
     /// event loop (the desktop app) turn this on; headless sessions run `footage.check` when
     /// they want it.
     pub check_footage_on_open: bool,
@@ -255,6 +256,9 @@ pub struct Session {
     pub footage_stamps: std::collections::HashMap<String, footage_reload::Stamp>,
     /// The disk cache's footage salt and the footage it was taken for ([`Session::refresh_disk_salt`]).
     pub disk_salt: Option<(u64, u64)>,
+    /// The footage files effects read the channels of, as last given to the footage source
+    /// ([`Session::refresh_aux_footage`]); `None` = not given yet.
+    pub aux_footage: Option<Vec<String>>,
     /// How many script-issued commands are running ([`Session::execute_for_script`]): while one
     /// is, settings that guard what scripts may do can't change (see
     /// [`prefs::Scripting::same_permissions`]).
@@ -382,6 +386,7 @@ impl Default for Session {
             stored_paths: Default::default(),
             footage_stamps: Default::default(),
             disk_salt: None,
+            aux_footage: None,
             script_calls: ScriptCalls::default(),
         }
     }
