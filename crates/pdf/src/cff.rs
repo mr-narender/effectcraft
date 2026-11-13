@@ -394,11 +394,16 @@ impl Cff {
         let private = |pd: &[(u16, Vec<f64>)]| -> (Vec<std::ops::Range<usize>>, (f64, f64)) {
             let Some(pv) = get(pd, 18).filter(|v| v.len() == 2) else { return (vec![], (0.0, 0.0)) };
             let (size, off) = (pv[0] as usize, pv[1] as usize);
-            let Some(bytes) = d.get(off..off + size) else { return (vec![], (0.0, 0.0)) };
+            let Some(bytes) = off.checked_add(size).and_then(|end| d.get(off..end)) else { return (vec![], (0.0, 0.0)) };
             let pr = dict(bytes);
             let nominal = get(&pr, 21).and_then(|v| v.first().copied()).unwrap_or(0.0);
             let default = get(&pr, 20).and_then(|v| v.first().copied()).unwrap_or(0.0);
-            let subrs = get(&pr, 19).and_then(|v| v.first().copied()).and_then(|s| index(d, off + s as usize)).map(|x| x.0).unwrap_or_default();
+            let subrs = get(&pr, 19)
+                .and_then(|v| v.first().copied())
+                .and_then(|s| off.checked_add(s as usize))
+                .and_then(|p| index(d, p))
+                .map(|x| x.0)
+                .unwrap_or_default();
             (subrs, (default, nominal))
         };
         let mut lsubrs = vec![];
@@ -533,12 +538,31 @@ impl Cff {
 
     /// A glyph's outline in glyph space (`font_matrix` maps it to text space) and its advance.
     pub fn outline(&self, gid: u16) -> Option<(BezPath, f64)> {
+        self.outline_depth(gid, 0, &mut { MAX_GLYPH_OPS })
+    }
+
+    /// `ops` is the glyph's instruction budget, shared by the base glyph and its seac components.
+    fn outline_depth(&self, gid: u16, depth: usize, ops: &mut usize) -> Option<(BezPath, f64)> {
         let r = self.charstrings.get(gid as usize)?.clone();
         let fd = self.fdselect.get(gid as usize).copied().unwrap_or(0) as usize;
         let fd = fd.min(self.lsubrs.len() - 1);
-        let mut st =
-            T2 { cff: self, fd, path: BezPath::new(), x: 0.0, y: 0.0, stack: vec![], stems: 0, width: None, open: false, done: false, depth: 0, seac: None };
+        let mut st = T2 {
+            cff: self,
+            fd,
+            path: BezPath::new(),
+            x: 0.0,
+            y: 0.0,
+            stack: vec![],
+            stems: 0,
+            width: None,
+            open: false,
+            done: false,
+            depth: 0,
+            ops: *ops,
+            seac: None,
+        };
         st.run(&self.data[r]);
+        *ops = st.ops;
         if st.open {
             st.path.close_path();
         }
@@ -547,13 +571,17 @@ impl Cff {
             _ => self.widths[fd].0,
         };
         let mut path = st.path;
-        // endchar seac: base and accent glyphs by standard code.
-        if let Some((adx, ady, b, a)) = st.seac {
+        // endchar seac: base and accent glyphs by standard code. The nesting is bounded like the
+        // Type 1 interpreter's: a font whose accented glyphs seac into each other (or into
+        // themselves) must not recurse until the stack overflows.
+        if let Some((adx, ady, b, a)) = st.seac
+            && depth < 2
+        {
             let find = |code: u8| crate::encoding::Base::Standard.name(code).and_then(|n| self.gid_by_name(&n));
-            if let Some((bp, _)) = find(b).and_then(|g| self.outline(g)) {
+            if let Some((bp, _)) = find(b).and_then(|g| self.outline_depth(g, depth + 1, ops)) {
                 path.extend(bp);
             }
-            if let Some((ap, _)) = find(a).and_then(|g| self.outline(g)) {
+            if let Some((ap, _)) = find(a).and_then(|g| self.outline_depth(g, depth + 1, ops)) {
                 path.extend(kurbo::Affine::translate((adx, ady)) * ap);
             }
         }
@@ -633,8 +661,15 @@ struct T2<'a> {
     open: bool,
     done: bool,
     depth: usize,
+    /// Instructions this glyph may still run, across its subroutine calls.
+    ops: usize,
     seac: Option<(f64, f64, u8, u8)>,
 }
+
+/// The most charstring instructions one glyph runs: subroutines that branch (two calls each,
+/// ten levels deep) would otherwise multiply a small font into unbounded work and geometry.
+/// A real glyph runs a few hundred.
+pub(crate) const MAX_GLYPH_OPS: usize = 100_000;
 
 impl T2<'_> {
     fn move_to(&mut self, dx: f64, dy: f64) {
@@ -685,6 +720,11 @@ impl T2<'_> {
         }
         let mut i = 0;
         while i < cs.len() && !self.done {
+            let Some(left) = self.ops.checked_sub(1) else {
+                self.done = true;
+                return;
+            };
+            self.ops = left;
             let b0 = cs[i];
             i += 1;
             match b0 {
@@ -835,7 +875,9 @@ impl T2<'_> {
                 }
                 11 => return,
                 14 => {
-                    self.take_width(false);
+                    // A width precedes the operands when the count is odd (5 with seac, 1 alone);
+                    // the no-width counts (0 and 4) are even, like the stems' and rmoveto's.
+                    self.take_width(true);
                     if self.stack.len() >= 4 {
                         let n = self.stack.len();
                         let s = &self.stack[n - 4..];
@@ -943,6 +985,12 @@ impl T2<'_> {
 /// named by custom strings.
 #[cfg(test)]
 pub(crate) fn write_test_cff(glyphs: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    write_test_cff_with_gsubrs(glyphs, &[])
+}
+
+/// [`write_test_cff`] with global subroutines.
+#[cfg(test)]
+pub(crate) fn write_test_cff_with_gsubrs(glyphs: &[(&str, Vec<u8>)], gsubrs: &[Vec<u8>]) -> Vec<u8> {
     fn idx(items: &[Vec<u8>]) -> Vec<u8> {
         let mut out = (items.len() as u16).to_be_bytes().to_vec();
         if items.is_empty() {
@@ -968,7 +1016,7 @@ pub(crate) fn write_test_cff(glyphs: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let names = idx(&[b"Test".to_vec()]);
     let strings: Vec<Vec<u8>> = glyphs.iter().skip(1).map(|(n, _)| n.as_bytes().to_vec()).collect();
     let strings_idx = idx(&strings);
-    let gsubrs = idx(&[]);
+    let gsubrs = idx(gsubrs);
     let cs = idx(&glyphs.iter().map(|(_, c)| c.clone()).collect::<Vec<_>>());
     // charset format 0: SIDs of glyphs 1.. (custom strings from 391).
     let mut charset = vec![0u8];
@@ -1047,5 +1095,168 @@ mod tests {
         assert_eq!(w, 600.0);
         assert!((p.area().abs() - 250_000.0).abs() < 1e-6, "{}", p.area());
         assert_eq!(p.bounding_box(), kurbo::Rect::new(50.0, 0.0, 550.0, 500.0));
+    }
+
+    /// An `endchar` seac whose base and accent name its own glyph used to recurse until the
+    /// stack overflowed and aborted the app; the depth limit cuts it off like the Type 1
+    /// interpreter's.
+    #[test]
+    fn seac_cycles_are_cut_off_not_a_stack_overflow() {
+        let enc = |v: i32| -> Vec<u8> {
+            if (-107..=107).contains(&v) {
+                vec![(v + 139) as u8]
+            } else {
+                let mut o = vec![28];
+                o.extend_from_slice(&(v as i16).to_be_bytes());
+                o
+            }
+        };
+        // `w adx ady bchar achar endchar`: both components are 'A' (standard code 65), this glyph.
+        let mut cs = vec![];
+        for v in [500, 0, 0, 65, 65] {
+            cs.extend(enc(v));
+        }
+        cs.push(14);
+        let font = write_test_cff(&[(".notdef", vec![14]), ("A", cs)]);
+        let cff = Cff::parse(&font).unwrap();
+        let (p, _) = cff.outline(cff.gid_by_name("A").unwrap()).unwrap();
+        assert!(p.elements().is_empty());
+    }
+
+    /// A global subroutine that calls itself ten times: 10^10 calls within the depth limit of
+    /// ten. The glyph stops at its instruction budget instead.
+    #[test]
+    fn branching_subroutines_stop_at_the_instruction_budget() {
+        // `-107 callgsubr` (bias 107) is subroutine 0.
+        let call = [32u8, 29];
+        let mut subr = call.repeat(10);
+        subr.push(11);
+        let mut cs = call.to_vec();
+        cs.push(14);
+        let font = write_test_cff_with_gsubrs(&[(".notdef", vec![14]), ("A", cs)], &[subr]);
+        let cff = Cff::parse(&font).unwrap();
+        let (p, _) = cff.outline(cff.gid_by_name("A").unwrap()).unwrap();
+        assert!(p.elements().is_empty());
+    }
+
+    /// The instruction budget is one per glyph: a seac whose base glyph spends all of it leaves
+    /// nothing for the accent, instead of each component getting a fresh budget.
+    #[test]
+    fn seac_components_share_the_instruction_budget() {
+        let call = [32u8, 29];
+        let mut subr = call.repeat(10);
+        subr.push(11);
+        // A square, then the branching subroutine that exhausts the budget.
+        let mut a = vec![139 + 100, 139 + 100, 139 - 100, 6];
+        a.extend(call);
+        a.push(14);
+        // `adx ady bchar achar endchar` with both components 'A' (standard code 65).
+        let seac = vec![139 + 10, 139 + 20, 139 + 65, 139 + 65, 14];
+        let font = write_test_cff_with_gsubrs(&[(".notdef", vec![14]), ("A", a), ("Aacute", seac)], &[subr]);
+        let cff = Cff::parse(&font).unwrap();
+        let (alone, _) = cff.outline(cff.gid_by_name("A").unwrap()).unwrap();
+        let (both, _) = cff.outline(cff.gid_by_name("Aacute").unwrap()).unwrap();
+        assert!(!alone.elements().is_empty());
+        assert_eq!(both.elements().len(), alone.elements().len(), "the accent gets no budget after the base spent it");
+    }
+
+    /// A CFF whose top DICT points its Private DICT at offsets near `usize::MAX`: `size` and `off`
+    /// come from the file, and reading the Private DICT must not overflow `off + size`.
+    #[test]
+    fn huge_private_dict_offsets_do_not_overflow() {
+        fn idx(items: &[Vec<u8>]) -> Vec<u8> {
+            let mut out = (items.len() as u16).to_be_bytes().to_vec();
+            if items.is_empty() {
+                return out;
+            }
+            out.push(4);
+            let mut off = 1u32;
+            out.extend_from_slice(&off.to_be_bytes());
+            for it in items {
+                off += it.len() as u32;
+                out.extend_from_slice(&off.to_be_bytes());
+            }
+            for it in items {
+                out.extend_from_slice(it);
+            }
+            out
+        }
+        let int = |v: i32| {
+            let mut o = vec![29];
+            o.extend_from_slice(&v.to_be_bytes());
+            o
+        };
+        // The BCD real "1E300": a size and an offset that both saturate at `usize::MAX`.
+        let huge = vec![0x1E, 0x1B, 0x30, 0x0F];
+        let header = [1u8, 0, 4, 4];
+        let names = idx(&[b"Test".to_vec()]);
+        let strings = idx(&[]);
+        let gsubrs = idx(&[]);
+        let charset = vec![0u8];
+        let cs = idx(&[vec![14]]); // one `.notdef` charstring: endchar
+        let top_len = 5 + 1 + 5 + 1 + huge.len() * 2 + 1;
+        let top_index_len = 2 + 1 + 8 + top_len;
+        let base = header.len() + names.len() + top_index_len + strings.len() + gsubrs.len();
+        let cs_off = base + charset.len();
+        let mut top = vec![];
+        top.extend(int(0));
+        top.push(15); // charset: ISOAdobe
+        top.extend(int(cs_off as i32));
+        top.push(17); // CharStrings
+        top.extend(&huge);
+        top.extend(&huge);
+        top.push(18); // Private: [size, offset]
+        assert_eq!(top.len(), top_len);
+        let mut out = header.to_vec();
+        out.extend(names);
+        out.extend(idx(&[top]));
+        out.extend(strings);
+        out.extend(gsubrs);
+        out.extend(charset);
+        out.extend(cs);
+        let cff = Cff::parse(&out).expect("the damaged Private DICT is skipped, the font parses");
+        assert_eq!(cff.glyph_count(), 1);
+    }
+
+    /// A four-operand `endchar` (`adx ady bchar achar`, no width) is a seac like the Type 1
+    /// interpreter's: `endchar` must not eat `adx` as a width, and a five-operand one reads its
+    /// width first.
+    #[test]
+    fn endchar_reads_its_width_by_operand_count() {
+        let enc = |v: i32| -> Vec<u8> {
+            if (-107..=107).contains(&v) {
+                vec![(v + 139) as u8]
+            } else {
+                let mut o = vec![28];
+                o.extend_from_slice(&(v as i16).to_be_bytes());
+                o
+            }
+        };
+        // The base glyph: a square drawn without a width (`500 500 -500 hlineto endchar`).
+        let mut square = vec![];
+        for v in [500, 500, -500] {
+            square.extend(enc(v));
+        }
+        square.extend([6, 14]);
+        // Four operands: `adx ady bchar achar endchar`, no width to take.
+        let mut seac = vec![];
+        for v in [10, 20, 65, 65] {
+            seac.extend(enc(v));
+        }
+        seac.push(14);
+        let font = write_test_cff(&[(".notdef", vec![14]), ("A", square.clone()), ("Aacute", seac)]);
+        let cff = Cff::parse(&font).unwrap();
+        let (p, _) = cff.outline(cff.gid_by_name("Aacute").unwrap()).unwrap();
+        assert!(!p.elements().is_empty(), "the base glyph of the seac is part of the outline");
+        // Five operands: the first is the width, the last four the seac.
+        let mut wide = vec![];
+        for v in [600, 0, 0, 65, 65] {
+            wide.extend(enc(v));
+        }
+        wide.push(14);
+        let font = write_test_cff(&[(".notdef", vec![14]), ("A", square), ("Awide", wide)]);
+        let cff = Cff::parse(&font).unwrap();
+        let (_, w) = cff.outline(cff.gid_by_name("Awide").unwrap()).unwrap();
+        assert_eq!(w, 600.0);
     }
 }
