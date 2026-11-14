@@ -71,8 +71,15 @@ The MSI's setup wizard ([`installer-ui.wxs`](../packaging/windows/installer-ui.w
 choose the install folder; upgrades and repairs reuse it, and `INSTALLFOLDER="..."` picks it for a
 silent (`/qn`) install. [`packaging-lint.yml`](../.github/workflows/packaging-lint.yml) install-tests
 that with stub binaries ([`test-msi.ps1`](../packaging/windows/test-msi.ps1)): a custom folder,
-an upgrade that keeps it, a repair, uninstall, and the Program Files default. The wizard pages
+an upgrade that keeps it, a repair, uninstall, and the all-users default folder (`Program Files\ArtCraft\EffectCraft`). The wizard pages
 themselves are checked by hand.
+
+The portable zip ships [`portable.txt`](../packaging/windows/portable.txt) beside `effectcraft.exe`.
+That marker (or an `EffectCraft.portable` file) switches on portable mode: the settings folder
+(preferences, shortcuts, recovery files, logs, plug-ins) becomes `EffectCraftData\` next to the
+exe instead of `%APPDATA%\EffectCraft`. If that folder isn't writable the app logs a warning and
+uses `%APPDATA%`. The MSI has no marker. The logic is in `crates/host/src/app_dirs.rs` and works
+the same on macOS and Linux; `EFFECTCRAFT_CONFIG_DIR` still wins over it.
 
 Every binary reports its version: `effectcraft --version`, `effectcraft-cli --version` and
 *Help › About EffectCraft*.
