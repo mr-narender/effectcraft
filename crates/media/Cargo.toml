@@ -27,11 +27,17 @@ craft-dpx = { workspace = true }
 craft-exr = { workspace = true, features = ["decode"] }
 craft-gif = { workspace = true, features = ["frames"] }
 craft-webp = { workspace = true, features = ["frames"] }
-craft-audio = { workspace = true, features = ["aac-decode"] }
+craft-audio = { workspace = true, features = ["aac-decode", "alac-decode", "opus-decode", "ac3-decode", "mp3-decode", "mpa-decode"] }
+craft-color = { workspace = true }
+craft-frame = { workspace = true }
 craft-media = { workspace = true, features = ["mpegts"] }
+craft-media-source = { workspace = true }
+craft-time = { workspace = true }
+craft-video = { workspace = true, features = ["h264-decode", "threads"] }
 filmcraft-frame = { workspace = true }
 filmcraft-color = { workspace = true }
 filmcraft-time = { workspace = true }
+half = { workspace = true }
 image = { workspace = true, features = ["gif", "webp", "tiff", "bmp", "exr", "tga", "hdr"] }
 rayon = { workspace = true }
 serde_json = { workspace = true }
@@ -39,6 +45,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+# Writes the OpenEXR files of the tests (reading is craft-exr's).
 exr = { workspace = true }
 # Writes the animated GIFs of the tests.
 gif = { workspace = true }
