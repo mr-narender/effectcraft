@@ -1,5 +1,5 @@
 //! Blocking client for the desktop app's JSON-lines control channel (`docs/control-protocol.md`).
-//! One persistent loopback connection, reconnected once if the app went away.
+//! One persistent loopback connection. Only explicitly read-only queries can be resent.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -11,6 +11,9 @@ use crate::{Error, Result};
 
 /// Slightly longer than the app's own 60 s per-request timeout, so its error reply wins.
 const READ_TIMEOUT: Duration = Duration::from_secs(65);
+/// The desktop control protocol's request-line limit, excluding the newline.
+/// Reject locally before writing, since closing an oversized request can reset the TCP stream.
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct BridgeClient {
     addr: String,
@@ -50,16 +53,23 @@ impl BridgeClient {
 
     /// Call a control method; returns the reply's `result`, or the app's `error` as [`Error::App`].
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        let retry_read =
+            matches!(method, "engine.commands" | "ui.menu.list" | "ui.inspect" | "ui.elements" | "ui.viewer.locate" | "ui.viewer.hit" | "ui.timeline.locate")
+                || (method == "ui.playback" && params["action"] == "status");
+        let unknown = |error| Error::Bridge(format!("`{method}` request outcome is unknown: {error}; inspect the app before retrying"));
         let mut last = Error::Bridge("not attempted".into());
         for attempt in 0..2 {
+            let id = self.next_id;
+            let line = format!("{}\n", json!({"id": id, "method": method, "params": params}));
+            if line.len() - 1 > MAX_REQUEST_BYTES {
+                return Err(Error::BadArgs(format!("control request exceeds {MAX_REQUEST_BYTES} bytes; it was not sent; split the script into smaller calls")));
+            }
             if self.conn.is_none() {
                 self.conn = Some(self.connect()?);
             }
-            let id = self.next_id;
-            self.next_id += 1;
+            self.next_id = self.next_id.checked_add(1).ok_or_else(|| Error::Bridge("control request id space exhausted".into()))?;
             let Some((r, w)) = self.conn.as_mut() else { continue };
-            let line = format!("{}\n", json!({"id": id, "method": method, "params": params}));
-            // `Ok(Err(_))`: the connection is dead before a reply (safe to resend once);
+            // `Ok(Err(_))`: transmission/reply failed (the app may have applied the request);
             // `Err(_)`: a timeout or bad reply (never resent: the app may have run the request).
             let res = (|| -> Result<std::result::Result<Value, Error>> {
                 if let Err(e) = w.write_all(line.as_bytes()) {
@@ -80,8 +90,11 @@ impl BridgeClient {
                 Ok(Ok(v)) if v.get("ok").and_then(Value::as_bool) == Some(true) => return Ok(v.get("result").cloned().unwrap_or(Value::Null)),
                 Ok(Ok(v)) => return Err(Error::App(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string())),
                 Ok(Err(e)) => {
-                    // Stale connection (app restarted): reconnect and resend once.
                     self.conn = None;
+                    if !retry_read {
+                        return Err(unknown(e));
+                    }
+                    // A read-only query can be repeated after a stale connection or lost reply.
                     last = e;
                     if attempt == 1 {
                         break;
@@ -90,10 +103,28 @@ impl BridgeClient {
                 Err(e) => {
                     // The stream may still deliver the late reply: start fresh next call.
                     self.conn = None;
-                    return Err(e);
+                    return Err(if retry_read { e } else { unknown(e) });
                 }
             }
         }
         Err(last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_serialized_script_is_refused_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = BridgeClient::new(&listener.local_addr().unwrap().to_string()).unwrap();
+        // Escaping doubles the bytes: checking the source length alone is insufficient.
+        let code = "\"".repeat(MAX_REQUEST_BYTES / 2);
+        let error = client.call("engine.execute", json!({"command": "script.run", "params": {"code": code}})).unwrap_err();
+        assert!(error.to_string().contains("not sent"), "{error}");
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        assert_eq!(client.next_id, 1);
     }
 }

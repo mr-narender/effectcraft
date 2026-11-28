@@ -58,6 +58,11 @@ impl<'a> Reader<'a> {
     pub fn f64(&mut self) -> Result<f64> {
         Ok(f64::from_bits(self.u64()?))
     }
+    /// A big-endian double where NaN and ±infinity read as 0 (they are never meaningful in a file).
+    pub fn f64_finite(&mut self) -> Result<f64> {
+        let v = self.f64()?;
+        Ok(if v.is_finite() { v } else { 0.0 })
+    }
     pub fn tag(&mut self) -> Result<[u8; 4]> {
         let b = self.bytes(4)?;
         Ok([b[0], b[1], b[2], b[3]])
@@ -75,12 +80,17 @@ impl<'a> Reader<'a> {
         let padded = total.div_ceil(pad) * pad;
         self.skip(padded - total)?;
         // Pascal strings are in the system (Mac Roman) encoding; ASCII covers the common case.
-        Ok(s.iter().map(|&b| if b < 0x80 { b as char } else { mac_roman(b) }).collect())
+        Ok(decode_mac_roman(s))
     }
 }
 
-/// Mac OS Roman upper half (0x80..=0xFF), as published by the Unicode Consortium mapping table.
-fn mac_roman(b: u8) -> char {
-    const T: &str = "ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔ\u{F8FF}ÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ";
-    T.chars().nth((b - 0x80) as usize).unwrap_or('?')
+/// Decode the legacy Pascal names in PSD and PSB.
+pub(crate) fn decode_mac_roman(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&byte| {
+            // Keep the ordinary space EffectCraft used for this byte in legacy Pascal names.
+            if byte == 0xca { ' ' } else { craft_codepage::windows_byte(craft_codepage::MAC_ROMAN_CODE_PAGE, byte) }
+        })
+        .collect()
 }
